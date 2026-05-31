@@ -1,0 +1,166 @@
+import cv2
+from picamera2 import Picamera2
+import numpy as np
+import struct
+import threading
+import sys
+import os
+
+try:
+    import serial
+except ImportError:
+    serial = None
+
+# 串口配置
+SERIAL_PORT = os.getenv("SERIAL_PORT", "/dev/serial0")
+BAUDRATE = 115200
+SERIAL_TIMEOUT = 1
+ENABLE_SERIAL = os.getenv("ENABLE_SERIAL", "1") != "0"
+
+# 通信协议
+START_BYTE = 0xAA
+END_BYTE = 0x55
+PACKET_ID_ROT_RECT = 0x03
+PACKET_ID_REFRESH = 0x04
+
+# 全局标志：是否需要重新识别矩形
+need_refresh_rect = False
+
+def build_rot_rect_packet(corners):
+    """打包旋转矩形顶点数据"""
+    corners = np.asarray(corners, dtype=np.int64).reshape(4, 2)
+    corners = np.clip(np.round(corners), 0, 65535).astype(np.uint16)
+    payload = struct.pack("<BHHHHHHHH",
+                          PACKET_ID_ROT_RECT,
+                          int(corners[0, 0]), int(corners[0, 1]),
+                          int(corners[1, 0]), int(corners[1, 1]),
+                          int(corners[2, 0]), int(corners[2, 1]),
+                          int(corners[3, 0]), int(corners[3, 1]))
+    checksum = sum(payload) & 0xFF
+    packet = bytes([START_BYTE]) + payload + bytes([checksum, END_BYTE])
+    return packet
+
+def open_serial_port(port=SERIAL_PORT, baudrate=BAUDRATE, timeout=SERIAL_TIMEOUT):
+    if serial is None:
+        print("Warning: pyserial 未安装，串口功能禁用")
+        return None
+    try:
+        ser = serial.Serial(port, baudrate=baudrate, timeout=timeout)
+        print(f"串口已打开：{port} @{baudrate}")
+        return ser
+    except serial.SerialException as exc:
+        print(f"无法打开串口 {port}: {exc}")
+        return None
+
+def send_rotated_rect_coordinates(ser, corners):
+    """发送矩形顶点到STM32"""
+    if ser is None:
+        return
+    packet = build_rot_rect_packet(corners)
+    try:
+        ser.write(packet)
+        ser.flush()
+        pts = [tuple(int(v) for v in pt) for pt in np.asarray(corners, dtype=np.int32)]
+        print(f"发送矩形顶点: {pts}")
+    except serial.SerialException as exc:
+        print(f"串口发送失败: {exc}")
+
+def serial_listener(ser):
+    """后台监听STM32的刷新指令"""
+    global need_refresh_rect
+    while True:
+        if ser is None:
+            break
+        try:
+            data = ser.read(3)
+            if len(data) == 3 and data[0] == START_BYTE and data[1] == PACKET_ID_REFRESH and data[2] == END_BYTE:
+                need_refresh_rect = True
+                print("收到STM32指令：重新识别矩形")
+        except Exception as e:
+            print(f"串口接收错误: {e}")
+            break
+
+def sort_corners_clockwise(corners):
+    """将4个顶点按顺时针排序：左上→右上→右下→左下"""
+    corners = sorted(corners, key=lambda p: p[1])
+    top = sorted(corners[:2], key=lambda p: p[0])
+    bottom = sorted(corners[2:], key=lambda p: p[0], reverse=True)
+    return np.array(top + bottom, dtype=np.int32)
+
+def detect_black_rectangle_frame(frame):
+    """检测A4纸边缘黑色电工胶带矩形"""
+    gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+    blur = cv2.GaussianBlur(gray, (5, 5), 0)
+    _, mask = cv2.threshold(blur, 80, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
+
+    kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (3, 3))
+    mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel, iterations=2)
+    mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel, iterations=1)
+
+    contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    best_corners = None
+
+    for cnt in contours:
+        area = cv2.contourArea(cnt)
+        if area < frame.shape[0] * frame.shape[1] * 0.1:
+            continue
+        peri = cv2.arcLength(cnt, True)
+        approx = cv2.approxPolyDP(cnt, 0.02 * peri, True)
+        if len(approx) == 4 and cv2.isContourConvex(approx):
+            box = cv2.minAreaRect(cnt)
+            corners = cv2.boxPoints(box)
+            best_corners = sort_corners_clockwise(corners)
+            break
+
+    return best_corners, mask
+
+def main():
+    global need_refresh_rect
+    picam2 = Picamera2()
+    config = picam2.create_preview_configuration(main={"size": (480, 320), "format": "BGR888"})
+    picam2.set_controls({"AeEnable": False, "AwbEnable": False, "ExposureTime": 10000, "AnalogueGain": 1.0})
+    picam2.configure(config)
+    picam2.start()
+
+    serial_port = None
+    if ENABLE_SERIAL:
+        serial_port = open_serial_port()
+        threading.Thread(target=serial_listener, args=(serial_port,), daemon=True).start()
+
+    print("按 'q' 退出程序")
+    last_corners = None
+
+    while True:
+        frame = picam2.capture_array()
+        display_frame = cv2.convertScaleAbs(frame, alpha=0.7, beta=0)
+
+        corners, mask = detect_black_rectangle_frame(frame)
+        
+        # 收到刷新指令或首次识别，更新矩形
+        if (need_refresh_rect or last_corners is None) and corners is not None:
+            last_corners = corners
+            need_refresh_rect = False
+            send_rotated_rect_coordinates(serial_port, last_corners)
+
+        # 绘制识别结果
+        if last_corners is not None:
+            poly = np.array(last_corners, dtype=np.int32)
+            cv2.polylines(display_frame, [poly], True, (0, 0, 255), 2)
+            for i, (x, y) in enumerate(poly):
+                cv2.circle(display_frame, (int(x), int(y)), 4, (0, 255, 0), -1)
+                cv2.putText(display_frame, str(i+1), (int(x)+5, int(y)-5),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 0, 0), 2)
+
+        cv2.imshow("Rect Tracking", display_frame)
+        cv2.imshow("Mask", mask)
+
+        if cv2.waitKey(1) & 0xFF == ord('q'):
+            break
+
+    picam2.stop()
+    if serial_port is not None:
+        serial_port.close()
+    cv2.destroyAllWindows()
+
+if __name__ == "__main__":
+    main()
