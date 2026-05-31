@@ -1,0 +1,261 @@
+import cv2
+from picamera2 import Picamera2
+import numpy as np
+import struct
+import threading
+import sys
+import os
+
+try:
+    import serial
+except ImportError:
+    serial = None
+
+# ===================== 可配置参数（后期直接修改此处）=====================
+# 云台初始角度参数（与STM32端INIT_PITCH_ANGLE/INIT_YAW_ANGLE对应）
+INIT_PITCH_ANGLE = 22.5  # 初始俯仰角度
+INIT_YAW_ANGLE = 35.0    # 初始偏航角度
+
+# 模式1正方形边长（单位：米，与STM32端SQUARE_SIDE_METER对应）
+SQUARE_SIDE_METER = 0.5  # 正方形边长，默认0.5米
+
+# 摄像头分辨率（需与STM32端CAM_WIDTH/CAM_HEIGHT一致）
+CAM_WIDTH = 480
+CAM_HEIGHT = 320
+
+# 正方形区域映射到图像的范围（归一化到图像像素）
+# 计算逻辑：将STM32端0~65535的归一化坐标映射到480x320像素
+SQUARE_CENTER_X_PX = CAM_WIDTH / 2
+SQUARE_CENTER_Y_PX = CAM_HEIGHT / 2
+SQUARE_HALF_SCALE_PX = (min(CAM_WIDTH, CAM_HEIGHT) * SQUARE_SIDE_METER) / 1.0  # 1.0为最大量程
+SQUARE_LEFT = int(SQUARE_CENTER_X_PX - SQUARE_HALF_SCALE_PX / 2)
+SQUARE_RIGHT = int(SQUARE_CENTER_X_PX + SQUARE_HALF_SCALE_PX / 2)
+SQUARE_TOP = int(SQUARE_CENTER_Y_PX - SQUARE_HALF_SCALE_PX / 2)
+SQUARE_BOTTOM = int(SQUARE_CENTER_Y_PX + SQUARE_HALF_SCALE_PX / 2)
+# 确保区域在图像范围内
+SQUARE_LEFT = max(0, SQUARE_LEFT)
+SQUARE_RIGHT = min(CAM_WIDTH - 1, SQUARE_RIGHT)
+SQUARE_TOP = max(0, SQUARE_TOP)
+SQUARE_BOTTOM = min(CAM_HEIGHT - 1, SQUARE_BOTTOM)
+# ======================================================================
+
+# 串口配置（完全保留代码A原有逻辑）
+SERIAL_PORT = os.getenv("SERIAL_PORT", "/dev/serial0")
+BAUDRATE = 115200
+SERIAL_TIMEOUT = 1
+ENABLE_SERIAL = os.getenv("ENABLE_SERIAL", "1") != "0"
+
+# 通信协议（和STM32完全匹配，保留代码A协议）
+START_BYTE = 0xAA
+END_BYTE = 0x55
+PACKET_ID_ROT_RECT = 0x03
+PACKET_ID_REFRESH = 0x04
+
+# 全局标志：是否需要重新识别矩形
+need_refresh_rect = False
+
+# 全局标志：当前模式（0=模式1，1=模式2），默认模式1
+current_mode = 0
+
+def build_rot_rect_packet(corners):
+    """打包旋转矩形顶点数据（和STM32解析协议完全一致）"""
+    corners = np.asarray(corners, dtype=np.int64).reshape(4, 2)
+    corners = np.clip(np.round(corners), 0, 65535).astype(np.uint16)
+    payload = struct.pack("<BHHHHHHHH",
+                          PACKET_ID_ROT_RECT,
+                          int(corners[0, 0]), int(corners[0, 1]),
+                          int(corners[1, 0]), int(corners[1, 1]),
+                          int(corners[2, 0]), int(corners[2, 1]),
+                          int(corners[3, 0]), int(corners[3, 1]))
+    checksum = sum(payload) & 0xFF
+    packet = bytes([START_BYTE]) + payload + bytes([checksum, END_BYTE])
+    return packet
+
+def open_serial_port(port=SERIAL_PORT, baudrate=BAUDRATE, timeout=SERIAL_TIMEOUT):
+    if serial is None:
+        print("Warning: pyserial 未安装，串口功能禁用")
+        return None
+    try:
+        ser = serial.Serial(port, baudrate=baudrate, timeout=timeout)
+        print(f"串口已打开：{port} @{baudrate}")
+        return ser
+    except serial.SerialException as exc:
+        print(f"无法打开串口 {port}: {exc}")
+        return None
+
+def send_rotated_rect_coordinates(ser, corners):
+    """发送矩形顶点到STM32（保留代码A防抖发送逻辑）"""
+    if ser is None:
+        return
+    packet = build_rot_rect_packet(corners)
+    try:
+        ser.write(packet)
+        ser.flush()
+        pts = [tuple(int(v) for v in pt) for pt in np.asarray(corners, dtype=np.int32)]
+        print(f"发送矩形顶点: {pts}")
+    except serial.SerialException as exc:
+        print(f"串口发送失败: {exc}")
+
+def serial_listener(ser):
+    """后台监听STM32的刷新指令（PA4恢复时触发，保留代码A双向通信）"""
+    global need_refresh_rect, current_mode
+    while True:
+        if ser is None:
+            break
+        try:
+            data = ser.read(3)
+            if len(data) == 3:
+                # 监听刷新指令
+                if data[0] == START_BYTE and data[1] == PACKET_ID_REFRESH and data[2] == END_BYTE:
+                    need_refresh_rect = True
+                    print("收到STM32指令：重新识别矩形")
+                # 可选：监听模式切换指令（如果需要从STM32同步模式）
+                # 这里预留扩展，可根据实际需求添加
+        except Exception as e:
+            print(f"串口接收错误: {e}")
+            break
+
+def sort_corners_clockwise(corners):
+    """将4个顶点按顺时针排序：左上→右上→右下→左下（和STM32插补顺序匹配，保留代码A逻辑）"""
+    corners = sorted(corners, key=lambda p: p[1])
+    top = sorted(corners[:2], key=lambda p: p[0])
+    bottom = sorted(corners[2:], key=lambda p: p[0], reverse=True)
+    return np.array(top + bottom, dtype=np.int32)
+
+def limit_to_square_area(frame):
+    """将图像裁剪到模式1的正方形区域内"""
+    # 创建掩码：只保留正方形区域内的像素
+    mask = np.zeros_like(frame[:, :, 0])
+    mask[SQUARE_TOP:SQUARE_BOTTOM, SQUARE_LEFT:SQUARE_RIGHT] = 255
+    # 应用掩码
+    frame_limited = cv2.bitwise_and(frame, frame, mask=mask)
+    return frame_limited, mask
+
+def detect_black_rectangle_frame(frame):
+    """
+    修改点1：红色光斑过滤 → 紫色光斑过滤，HSV参数与代码B完全一致
+    修改点2：黑色矩形识别阈值、面积参数与代码B完全对齐
+    修改点3：模式1时只识别正方形内的区域
+    其余识别逻辑保留代码A鲁棒性设计
+    """
+    global current_mode
+    
+    # --------------------------
+    # 模式1：裁剪到正方形区域内识别
+    # --------------------------
+    if current_mode == 0:
+        frame, square_mask = limit_to_square_area(frame)
+    
+    # --------------------------
+    # 第一步：过滤紫色光斑，消除激光点干扰（参数与代码B完全一致）
+    # --------------------------
+    hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
+    # 紫色HSV范围100%复用代码B的参数
+    lower_purple = np.array([105, 80, 50])
+    upper_purple = np.array([135, 250, 255])
+    purple_mask = cv2.inRange(hsv, lower_purple, upper_purple)
+    # 用白色填充紫色光斑区域，消除对黑胶带识别的干扰
+    frame_no_purple = frame.copy()
+    frame_no_purple[purple_mask > 0] = (255, 255, 255)
+
+    # --------------------------
+    # 第二步：黑胶带识别（参数与代码B完全对齐）
+    # --------------------------
+    gray = cv2.cvtColor(frame_no_purple, cv2.COLOR_BGR2GRAY)
+    blur = cv2.GaussianBlur(gray, (5, 5), 0)
+    # 自适应OTSU阈值，与代码B参数一致
+    _, mask = cv2.threshold(blur, 80, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
+
+    # 形态学操作，与代码B逻辑一致
+    kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (5, 5))
+    mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel, iterations=2)
+    mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel, iterations=1)
+
+    # 模式1时，将掩码限制在正方形区域内
+    if current_mode == 0:
+        mask = cv2.bitwise_and(mask, square_mask)
+
+    h_img, w_img = gray.shape
+    # 修改点3：最小面积、最小边长阈值100%对齐代码B（0.09→原代码A是0.08）
+    min_area = w_img * h_img * 0.09
+    min_side = min(w_img, h_img) * 0.02
+
+    contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    best_corners = None
+    best_area = 0
+
+    for cnt in contours:
+        area = cv2.contourArea(cnt)
+        if area < min_area:
+            continue
+        x, y, w, h = cv2.boundingRect(cnt)
+        if w < min_side or h < min_side:
+            continue
+
+        peri = cv2.arcLength(cnt, True)
+        approx = cv2.approxPolyDP(cnt, 0.02 * peri, True)
+        # 只保留凸四边形轮廓（A4靶纸）
+        if len(approx) == 4 and cv2.isContourConvex(approx):
+            box = cv2.minAreaRect(cnt)
+            corners = cv2.boxPoints(box)
+            if area > best_area:
+                best_area = area
+                best_corners = corners
+
+    # 顶点顺时针排序，匹配STM32运动顺序（保留代码A核心逻辑）
+    if best_corners is not None:
+        best_corners = sort_corners_clockwise(best_corners)
+
+    return best_corners, mask
+
+def main():
+    global need_refresh_rect, current_mode
+    # 摄像头初始化（完全保留代码A原有配置）
+    picam2 = Picamera2()
+    config = picam2.create_preview_configuration(main={"size": (CAM_WIDTH, CAM_HEIGHT), "format": "BGR888"})
+    picam2.set_controls({"AeEnable": True, "AwbEnable": True, "ExposureTime": 8000, "AnalogueGain": 1.2})
+    picam2.configure(config)
+    picam2.start()
+
+    # 串口初始化+后台监听线程（保留代码A双向通信）
+    serial_port = None
+    if ENABLE_SERIAL:
+        serial_port = open_serial_port()
+        threading.Thread(target=serial_listener, args=(serial_port,), daemon=True).start()
+
+    print("="*50)
+    print(f"当前配置参数：")
+    print(f"  云台初始俯仰角度：{INIT_PITCH_ANGLE}°")
+    print(f"  云台初始偏航角度：{INIT_YAW_ANGLE}°")
+    print(f"  模式1正方形边长：{SQUARE_SIDE_METER}米")
+    print(f"  模式1识别区域：X[{SQUARE_LEFT}, {SQUARE_RIGHT}] Y[{SQUARE_TOP}, {SQUARE_BOTTOM}]")
+    print("="*50)
+    print("按 'q' 退出程序")
+    print("按 '1' 切换到模式1（固定正方形）")
+    print("按 '2' 切换到模式2（识别黑色胶带矩形）")
+    last_corners = None  # 缓存上一次识别的顶点，避免重复发送（保留代码A防抖逻辑）
+
+    while True:
+        frame = picam2.capture_array()
+        display_frame = cv2.convertScaleAbs(frame, alpha=0.7, beta=0)
+
+        # 绘制模式1的正方形识别区域
+        cv2.rectangle(display_frame, (SQUARE_LEFT, SQUARE_TOP), (SQUARE_RIGHT, SQUARE_BOTTOM), 
+                      (255, 255, 0), 1, cv2.LINE_AA)
+        cv2.putText(display_frame, f"Mode {current_mode+1}", (10, 30),
+                    cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 0), 2)
+
+        # 识别黑胶带矩形
+        corners, mask = detect_black_rectangle_frame(frame)
+        
+        # 核心逻辑：模式2刷新机制（完全保留代码A逻辑）
+        # 1. 首次识别 2. 收到STM32刷新指令（PA4恢复） → 更新顶点并发送
+        if current_mode == 1 and (need_refresh_rect or last_corners is None) and corners is not None:
+            last_corners = corners
+            need_refresh_rect = False
+            send_rotated_rect_coordinates(serial_port, last_corners)
+
+        # 绘制识别结果
+        if last_corners is not None and current_mode == 1:
+            poly = np.array(last_corners, dtype=np.int32)
+            cv2.polylines(d
