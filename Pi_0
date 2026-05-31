@@ -88,10 +88,24 @@ def sort_corners_clockwise(corners):
     return np.array(top + bottom, dtype=np.int32)
 
 def detect_black_rectangle_frame(frame):
-    """检测A4纸边缘黑色电工胶带矩形"""
-    gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+    """检测A4纸边缘黑色电工胶带矩形（优化：过滤红色光斑干扰）"""
+    # 第一步：过滤红色光斑，避免干扰识别
+    hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
+    lower_red1 = np.array([0, 120, 70])
+    upper_red1 = np.array([10, 255, 255])
+    lower_red2 = np.array([170, 120, 70])
+    upper_red2 = np.array([180, 255, 255])
+    red_mask1 = cv2.inRange(hsv, lower_red1, upper_red1)
+    red_mask2 = cv2.inRange(hsv, lower_red2, upper_red2)
+    red_mask = red_mask1 | red_mask2
+    # 用白色填充红色光斑区域，消除干扰
+    frame_no_red = frame.copy()
+    frame_no_red[red_mask > 0] = (255, 255, 255)
+
+    # 黑胶带识别
+    gray = cv2.cvtColor(frame_no_red, cv2.COLOR_BGR2GRAY)
     blur = cv2.GaussianBlur(gray, (5, 5), 0)
-    _, mask = cv2.threshold(blur, 80, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
+    _, mask = cv2.threshold(blur, 70, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
 
     kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (3, 3))
     mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel, iterations=2)
@@ -102,7 +116,8 @@ def detect_black_rectangle_frame(frame):
 
     for cnt in contours:
         area = cv2.contourArea(cnt)
-        if area < frame.shape[0] * frame.shape[1] * 0.1:
+        # 过滤过小和过大的轮廓
+        if area < frame.shape[0] * frame.shape[1] * 0.08 or area > frame.shape[0] * frame.shape[1] * 0.8:
             continue
         peri = cv2.arcLength(cnt, True)
         approx = cv2.approxPolyDP(cnt, 0.02 * peri, True)
@@ -118,7 +133,7 @@ def main():
     global need_refresh_rect
     picam2 = Picamera2()
     config = picam2.create_preview_configuration(main={"size": (480, 320), "format": "BGR888"})
-    picam2.set_controls({"AeEnable": False, "AwbEnable": False, "ExposureTime": 10000, "AnalogueGain": 1.0})
+    picam2.set_controls({"AeEnable": True, "AwbEnable": True, "ExposureTime": 8000, "AnalogueGain": 1.2})
     picam2.configure(config)
     picam2.start()
 
