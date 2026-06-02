@@ -1,0 +1,289 @@
+import cv2
+from picamera2 import Picamera2
+import numpy as np
+import struct
+import threading
+import sys
+import os
+
+try:
+    import serial
+except ImportError:
+    serial = None
+
+# ===================== 锟斤拷锟斤拷锟节匡拷直锟斤拷锟睫改的诧拷锟斤拷锟斤拷锟斤拷=====================
+# 1. 锟斤拷维锟斤拷台2锟斤拷锟斤拷锟斤拷某锟绞硷拷嵌炔锟斤拷锟斤拷锟斤拷锟絊TM32锟剿憋拷锟斤拷一锟铰硷拷锟缴ｏ拷
+INIT_PITCH_ANGLE = 22.5  # 锟斤拷始锟斤拷锟斤拷锟角讹拷
+INIT_YAW_ANGLE = 35.0    # 锟斤拷始偏锟斤拷锟角讹拷
+
+# 2. 模式一锟斤拷锟斤拷锟斤拷锟轿边筹拷锟斤拷锟斤拷锟斤拷锟斤拷位锟斤拷锟阶ｏ拷
+SQUARE_SIDE_METER = 0.8  # 默锟斤拷0.5锟阶ｏ拷锟睫改此达拷锟斤拷锟缴碉拷锟斤拷锟竭筹拷
+# ======================================================================
+
+# 锟斤拷锟斤拷锟斤拷锟矫ｏ拷一锟斤拷锟斤拷锟斤拷锟睫改ｏ拷
+CAM_WIDTH = 1280
+CAM_HEIGHT = 720
+
+# 模式1识远悖ㄔ队充到头妫?SQUARE_CENTER_X_PX = CAM_WIDTH / 2
+SQUARE_CENTER_Y_PX = CAM_HEIGHT / 2
+SQUARE_HALF_SCALE_PX = (min(CAM_WIDTH, CAM_HEIGHT) * SQUARE_SIDE_METER) / 1.0
+# 锟斤拷锟斤拷锟斤拷锟斤拷锟轿边界，确锟斤拷锟斤拷锟斤拷锟斤拷锟斤拷锟芥范围
+# SQUARE_LEFT = max(0, int(SQUARE_CENTER_X_PX - SQUARE_HALF_SCALE_PX / 2))
+# SQUARE_RIGHT = min(CAM_WIDTH - 1, int(SQUARE_CENTER_X_PX + SQUARE_HALF_SCALE_PX / 2))
+# SQUARE_TOP = max(0, int(SQUARE_CENTER_Y_PX - SQUARE_HALF_SCALE_PX / 2))
+# SQUARE_BOTTOM = min(CAM_HEIGHT - 1, int(SQUARE_CENTER_Y_PX + SQUARE_HALF_SCALE_PX / 2))
+SQUARE_LEFT = 0
+SQUARE_RIGHT = CAM_WIDTH - 1
+SQUARE_TOP = 0
+SQUARE_BOTTOM = CAM_HEIGHT - 1
+#
+SERIAL_PORT = os.getenv("SERIAL_PORT", "/dev/serial0")
+BAUDRATE = 115200
+SERIAL_TIMEOUT = 1
+ENABLE_SERIAL = os.getenv("ENABLE_SERIAL", "1") != "0"
+
+# 锟斤拷STM32匹锟斤拷锟酵拷锟叫拷锟?START_BYTE = 0xAA
+END_BYTE = 0x55
+PACKET_ID_ROT_RECT = 0x03
+PACKET_ID_REFRESH = 0x04
+
+# 全锟斤拷状态锟斤拷志
+need_refresh_rect = False  # 锟角凤拷锟斤拷要锟斤拷锟斤拷识锟斤拷锟斤拷锟?current_mode = 0           # 0=模式1锟斤拷锟教讹拷锟斤拷锟斤拷锟轿ｏ拷锟斤拷1=模式2锟斤拷识锟斤拷锟缴拷锟斤拷锟斤拷锟斤拷危锟?
+
+# ===================== 锟斤拷锟斤拷锟睫改ｏ拷锟斤拷锟斤拷锟斤拷模式锟斤拷锟斤拷锟斤拷锟揭伙拷锟斤拷呒锟?=====================
+def build_rot_rect_packet(corners):
+    corners = np.asarray(corners, dtype=np.int64).reshape(4, 2)
+    # 锟矫硷拷锟斤拷锟斤拷锟斤拷头实锟斤拷锟斤拷锟截凤拷围
+    corners = np.clip(np.round(corners), 0, [CAM_WIDTH-1, CAM_HEIGHT-1]).astype(np.uint16)
+    # 锟斤拷一锟斤拷锟斤拷0~65535锟斤拷锟斤拷模式锟斤拷使锟矫ｏ拷模式一锟斤拷锟斤拷锟矫此猴拷锟斤拷锟斤拷
+    corners = (corners / np.array([CAM_WIDTH-1, CAM_HEIGHT-1])) * 65535
+    corners = np.clip(corners, 0, 65535).astype(np.uint16)
+    
+    payload = struct.pack("<BHHHHHHHH",
+                          PACKET_ID_ROT_RECT,
+                          int(corners[0, 0]), int(corners[0, 1]),
+                          int(corners[1, 0]), int(corners[1, 1]),
+                          int(corners[2, 0]), int(corners[2, 1]),
+                          int(corners[3, 0]), int(corners[3, 1]))
+    checksum = sum(payload) & 0xFF
+    packet = bytes([START_BYTE]) + payload + bytes([checksum, END_BYTE])
+    return packet
+
+
+
+def open_serial_port(port=SERIAL_PORT, baudrate=BAUDRATE, timeout=SERIAL_TIMEOUT):
+    if serial is None:
+        print("Warning: pyserial 未锟斤拷装锟斤拷锟斤拷锟节癸拷锟杰斤拷锟斤拷")
+        return None
+    try:
+        ser = serial.Serial(port, baudrate=baudrate, timeout=timeout)
+        print(f"锟斤拷锟斤拷锟窖打开ｏ拷{port} @{baudrate}")
+        return ser
+    except serial.SerialException as exc:
+        print(f"锟睫凤拷锟津开达拷锟斤拷 {port}: {exc}")
+        return None
+
+
+def send_rotated_rect_coordinates(ser, corners):
+    """锟斤拷锟酵撅拷锟轿讹拷锟姐到STM32"""
+    if ser is None:
+        return
+    packet = build_rot_rect_packet(corners)
+    try:
+        ser.write(packet)
+        ser.flush()
+        pts = [tuple(int(v) for v in pt) for pt in np.asarray(corners, dtype=np.int32)]
+        print(f"锟斤拷锟酵撅拷锟轿讹拷锟斤拷: {pts}")
+    except serial.SerialException as exc:
+        print(f"锟斤拷锟节凤拷锟斤拷失锟斤拷: {exc}")
+
+def serial_listener(ser):
+    """锟斤拷台锟斤拷锟斤拷STM32锟斤拷刷锟斤拷指锟筋（PA4锟街革拷时锟斤拷锟斤拷锟斤拷"""
+    global need_refresh_rect
+    while True:
+        if ser is None:
+            break
+        try:
+            data = ser.read(3)
+            if len(data) == 3 and data[0] == START_BYTE and data[1] == PACKET_ID_REFRESH and data[2] == END_BYTE:
+                need_refresh_rect = True
+                print("锟秸碉拷STM32指锟筋：锟斤拷锟斤拷识锟斤拷锟斤拷锟?)
+        except Exception as e:
+            print(f"锟斤拷锟节斤拷锟秸达拷锟斤拷: {e}")
+            break
+
+
+def sort_corners_clockwise(corners):
+    """锟斤拷锟斤拷顺时锟斤拷锟斤拷锟斤拷锟斤拷锟较★拷锟斤拷锟较★拷锟斤拷锟铰★拷锟斤拷锟铰ｏ拷锟斤拷STM32锟藉补顺锟斤拷匹锟戒）"""
+    corners = sorted(corners, key=lambda p: p[1])
+    top = sorted(corners[:2], key=lambda p: p[0])
+    bottom = sorted(corners[2:], key=lambda p: p[0], reverse=True)
+    return np.array(top + bottom, dtype=np.int32)
+
+
+def limit_to_square_area(frame):
+    """模式1专锟矫ｏ拷锟斤拷锟斤拷锟斤拷锟斤拷锟斤拷锟斤拷锟斤拷锟斤拷锟节的伙拷锟芥，锟斤拷锟斤拷锟解部锟斤拷锟斤拷"""
+    mask = np.zeros_like(frame[:, :, 0])
+    mask[SQUARE_TOP:SQUARE_BOTTOM, SQUARE_LEFT:SQUARE_RIGHT] = 255
+    frame_limited = cv2.bitwise_and(frame, frame, mask=mask)
+    return frame_limited, mask
+
+
+def detect_black_rectangle_frame(frame):
+    """锟斤拷色锟斤拷锟斤拷识锟斤拷锟斤拷暮锟斤拷锟斤拷锟斤拷薷锟斤拷妫?""
+    global current_mode
+    
+    # 模式1锟斤拷锟斤拷识锟斤拷锟斤拷锟斤拷锟斤拷锟节碉拷锟斤拷锟斤拷锟斤拷锟斤拷锟解部锟斤拷锟斤拷
+    square_mask = None
+    if current_mode == 0:
+        frame, square_mask = limit_to_square_area(frame)
+        # ========== 锟睫革拷1锟斤拷锟斤拷色锟斤拷锟剿斤拷模式1执锟叫ｏ拷模式2锟斤拷全锟斤拷锟斤拷锟斤拷锟斤拷锟斤拷锟狡伙拷锟斤拷色锟斤拷锟斤拷锟斤拷锟斤拷 ==========
+        hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
+        lower_purple = np.array([105, 80, 50])
+        upper_purple = np.array([135, 250, 255])
+        purple_mask = cv2.inRange(hsv, lower_purple, upper_purple)
+        frame[purple_mask > 0] = (255, 255, 255)
+
+    # 锟节斤拷锟斤拷识锟斤拷锟斤拷锟斤拷呒锟?    gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+    blur = cv2.GaussianBlur(gray, (5, 5), 0)
+    _, mask = cv2.threshold(blur, 80, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
+
+    # 锟斤拷态学去锟斤拷
+    kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (5, 5))
+    mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel, iterations=2)
+    mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel, iterations=1)
+
+    # 模式1锟斤拷锟斤拷锟斤拷识锟斤拷锟斤拷锟斤拷锟斤拷锟斤拷锟斤拷锟斤拷锟斤拷
+    if current_mode == 0 and square_mask is not None:
+        mask = cv2.bitwise_and(mask, square_mask)
+
+    # 锟斤拷锟斤拷筛选
+    h_img, w_img = gray.shape
+    min_area = w_img * h_img * 0.09
+    min_side = min(w_img, h_img) * 0.02
+    contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    best_corners = None
+    best_area = 0
+
+    for cnt in contours:
+        area = cv2.contourArea(cnt)
+        if area < min_area:
+            continue
+        x, y, w, h = cv2.boundingRect(cnt)
+        if w < min_side or h < min_side:
+            continue
+
+        peri = cv2.arcLength(cnt, True)
+        approx = cv2.approxPolyDP(cnt, 0.02 * peri, True)
+        if len(approx) == 4 and cv2.isContourConvex(approx):
+            box = cv2.minAreaRect(cnt)
+            corners = cv2.boxPoints(box)
+            if area > best_area:
+                best_area = area
+                best_corners = corners
+
+    # ========== 锟睫革拷2锟斤拷锟斤拷锟斤拷识锟金兜碉拷锟竭硷拷锟斤拷锟斤拷缘锟斤拷锟斤拷锟斤拷时也锟斤拷识锟斤拷 ==========
+    if best_corners is None and contours:
+        cnt = max(contours, key=cv2.contourArea)
+        if cv2.contourArea(cnt) >= min_area:
+            box = cv2.minAreaRect(cnt)
+            best_corners = cv2.boxPoints(box)
+    # 锟斤拷锟斤拷统一锟斤拷锟斤拷
+    if best_corners is not None:
+        best_corners = sort_corners_clockwise(best_corners)
+
+    return best_corners, mask
+
+
+def main():
+    global need_refresh_rect, current_mode
+    # 锟斤拷锟斤拷头锟斤拷始锟斤拷
+    picam2 = Picamera2()
+    config = picam2.create_preview_configuration(main={"size": (CAM_WIDTH, CAM_HEIGHT), "format": "BGR888"})
+    # ========== 锟睫革拷3锟斤拷锟截憋拷锟皆讹拷锟截癸拷/锟皆讹拷锟斤拷平锟解，锟教讹拷锟斤拷锟斤拷锟斤拷锟饺ｏ拷锟酵第讹拷锟捷匡拷识锟斤拷锟斤拷锟斤拷锟斤拷 ==========
+    picam2.set_controls({"AeEnable": False, "AwbEnable": False, "ExposureTime": 10000, "AnalogueGain": 1.0})
+    picam2.configure(config)
+    picam2.start()
+
+    # 锟斤拷锟节筹拷始锟斤拷+锟斤拷台锟斤拷锟斤拷锟竭筹拷
+    serial_port = None
+    if ENABLE_SERIAL:
+        serial_port = open_serial_port()
+        threading.Thread(target=serial_listener, args=(serial_port,), daemon=True).start()
+
+    # 锟斤拷锟斤拷锟斤拷锟斤拷锟斤拷印
+    print("="*50)
+    print(f"锟斤拷前锟斤拷锟矫诧拷锟斤拷锟斤拷")
+    print(f"  锟斤拷台锟斤拷始锟斤拷锟斤拷锟角度ｏ拷{INIT_PITCH_ANGLE}锟斤拷")
+    print(f"  锟斤拷台锟斤拷始偏锟斤拷锟角度ｏ拷{INIT_YAW_ANGLE}锟斤拷")
+    print(f"  模式1锟斤拷锟斤拷锟轿边筹拷锟斤拷{SQUARE_SIDE_METER}锟斤拷")
+    print(f"  模式1识锟斤拷锟斤拷锟斤拷X[{SQUARE_LEFT}, {SQUARE_RIGHT}] Y[{SQUARE_TOP}, {SQUARE_BOTTOM}]")
+    print("="*50)
+    print("锟斤拷锟斤拷说锟斤拷锟斤拷")
+    print("  锟斤拷 'q' 锟剿筹拷锟斤拷锟斤拷")
+    print("  锟斤拷 '1' 锟叫伙拷锟斤拷模式1锟斤拷锟教讹拷锟斤拷锟斤拷锟轿ｏ拷")
+    print("  锟斤拷 '2' 锟叫伙拷锟斤拷模式2锟斤拷识锟斤拷锟缴拷锟斤拷锟斤拷锟斤拷危锟?)
+    print("="*50)
+
+    last_corners = None  # 锟斤拷锟姐缓锟斤拷锟斤拷锟?
+    while True:
+        frame = picam2.capture_array()
+        display_frame = cv2.convertScaleAbs(frame, alpha=0.7, beta=0)
+
+        # 锟斤拷锟斤拷模式1锟斤拷锟斤拷锟斤拷锟斤拷识锟斤拷呓锟?        cv2.rectangle(display_frame, (SQUARE_LEFT, SQUARE_TOP), (SQUARE_RIGHT, SQUARE_BOTTOM),
+                      (255, 255, 0), 1, cv2.LINE_AA)
+        # 锟斤拷锟狡碉拷前模式
+        cv2.putText(display_frame, f"Mode {current_mode+1}", (10, 30),
+                    cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 0), 2)
+
+        # 识锟斤拷锟缴拷锟斤拷锟?        corners, mask = detect_black_rectangle_frame(frame)
+        
+        # ========== 锟睫革拷4锟斤拷模式2锟斤拷每帧锟皆讹拷锟斤拷锟斤拷识锟斤拷锟斤拷锟斤拷取锟斤拷锟斤拷锟斤拷锟秸碉拷STM32指锟斤拷锟斤拷锟斤拷锟?==========
+        # ===================== 锟斤拷锟睫革拷锟斤拷只锟斤拷锟斤拷一锟斤拷 / 锟戒化锟脚凤拷锟斤拷 =====================
+        if current_mode == 1 and corners is not None:
+            send_flag = False
+            if last_corners is None or need_refresh_rect:
+                send_flag = True
+            else:
+                for i in range(4):
+                    if abs(corners[i][0] - last_corners[i][0]) > 50 or abs(corners[i][1] - last_corners[i][1]) > 50:
+                        send_flag = True
+                        break
+
+            if send_flag:
+                send_rotated_rect_coordinates(serial_port, corners)
+                last_corners = corners.copy()
+                need_refresh_rect = False
+
+        if last_corners is not None and current_mode == 1:
+            poly = np.array(last_corners, dtype=np.int32)
+            cv2.polylines(display_frame, [poly], True, (0, 0, 255), 2)
+            for i, (x, y) in enumerate(poly):
+                cv2.circle(display_frame, (int(x), int(y)), 4, (0, 255, 0), -1)
+                cv2.putText(display_frame, str(i+1), (int(x)+5, int(y)-5),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 0, 0), 2)
+
+        cv2.imshow("Rect Tracking", display_frame)
+        cv2.imshow("Mask", mask)
+
+        key = cv2.waitKey(1) & 0xFF
+        if key == ord('q'):
+            break
+        elif key == ord('1'):
+            current_mode = 0
+            last_corners = None
+            print("锟叫伙拷锟斤拷模式1锟斤拷锟教讹拷锟斤拷锟斤拷锟斤拷")
+        elif key == ord('2'):
+            current_mode = 1
+            last_corners = None
+            need_refresh_rect = True
+            print("锟叫伙拷锟斤拷模式2锟斤拷识锟斤拷锟缴拷锟斤拷锟斤拷锟斤拷锟?)
+
+    picam2.stop()
+    if serial_port is not None:
+        serial_port.close()
+    cv2.destroyAllWindows()
+
+
+if __name__ == "__main__":
+    main()
