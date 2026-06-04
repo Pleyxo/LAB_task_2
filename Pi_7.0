@@ -1,0 +1,300 @@
+import cv2
+from picamera2 import Picamera2
+import numpy as np
+import struct
+import threading
+import sys
+import os
+try:
+    import serial
+except ImportError:
+    serial = None
+
+# ===================== 可配置参数（全部在此处修改） =====================
+# 物理校准参数
+DISTANCE_TO_SCREEN = 1.0
+SQUARE_ACTUAL_SIZE = 0.5
+
+# 云台初始角度
+INIT_PITCH_ANGLE = 22.5
+INIT_YAW_ANGLE = 35.0
+
+SQUARE_SIDE_METER = 0.8
+
+# 摄像头识别范围参数
+RECOGNITION_WIDTH = 800
+RECOGNITION_HEIGHT = 600
+RECOGNITION_OFFSET_X = 0
+RECOGNITION_OFFSET_Y = 0
+
+# 映射参数
+NORM_X_MIN = 9830
+NORM_X_MAX = 55705
+NORM_Y_MIN = 9830
+NORM_Y_MAX = 55705
+NORM_SCALE_X = NORM_X_MAX - NORM_X_MIN
+NORM_SCALE_Y = NORM_Y_MAX - NORM_Y_MIN
+
+ENABLE_PERSPECTIVE_CORRECTION = False
+# ===================================================
+
+CAM_WIDTH = 1280
+CAM_HEIGHT = 760
+
+RECOGNITION_LEFT = max(0, (CAM_WIDTH - RECOGNITION_WIDTH) // 2 + RECOGNITION_OFFSET_X)
+RECOGNITION_RIGHT = min(CAM_WIDTH - 1, RECOGNITION_LEFT + RECOGNITION_WIDTH)
+RECOGNITION_TOP = max(0, (CAM_HEIGHT - RECOGNITION_HEIGHT) // 2 + RECOGNITION_OFFSET_Y)
+RECOGNITION_BOTTOM = min(CAM_HEIGHT - 1, RECOGNITION_TOP + RECOGNITION_HEIGHT)
+
+RECOGNITION_WIDTH_ACTUAL = RECOGNITION_RIGHT - RECOGNITION_LEFT
+RECOGNITION_HEIGHT_ACTUAL = RECOGNITION_BOTTOM - RECOGNITION_TOP
+
+SQUARE_CENTER_X_PX = CAM_WIDTH / 2
+SQUARE_CENTER_Y_PX = CAM_HEIGHT / 2
+SQUARE_HALF_SCALE_PX = (min(CAM_WIDTH, CAM_HEIGHT) * SQUARE_SIDE_METER) / 1.0
+
+SERIAL_PORT = os.getenv("SERIAL_PORT", "/dev/serial0")
+BAUDRATE = 115200
+SERIAL_TIMEOUT = 1
+ENABLE_SERIAL = os.getenv("ENABLE_SERIAL", "1") != "0"
+
+START_BYTE = 0xAA
+END_BYTE = 0x55
+PACKET_ID_ROT_RECT = 0x03
+PACKET_ID_REFRESH = 0x04
+
+need_refresh_rect = False
+current_mode = 0
+
+def perspective_correct(x, y, D=1.0):
+    alpha = np.arctan(x / D)
+    beta = np.arctan(y * np.cos(alpha) / D)
+    yaw_angle = 42.0 + alpha * 180 / np.pi * (9.45 / 14.04)
+    pitch_angle = -11.0 + beta * 180 / np.pi * (14.175 / 14.04)
+    norm_x = 65535 * ((yaw_angle - 42.0) / 27 + 0.5)
+    norm_y = 65535 * ((pitch_angle + 11.0) / 40.5 + 0.5)
+    return norm_x, norm_y
+
+def build_rot_rect_packet(corners):
+    corners = np.asarray(corners, dtype=np.int64).reshape(4, 2)
+    corners = np.clip(np.round(corners), 0, [CAM_WIDTH-1, CAM_HEIGHT-1]).astype(np.float32)
+
+    rel_x = (corners[:, 0] - RECOGNITION_LEFT) / RECOGNITION_WIDTH_ACTUAL
+    rel_y = (corners[:, 1] - RECOGNITION_TOP) / RECOGNITION_HEIGHT_ACTUAL
+
+    if ENABLE_PERSPECTIVE_CORRECTION:
+        screen_x = (rel_x - 0.5) * SQUARE_ACTUAL_SIZE
+        screen_y = (rel_y - 0.5) * SQUARE_ACTUAL_SIZE
+        norm_x, norm_y = perspective_correct(screen_x, screen_y, DISTANCE_TO_SCREEN)
+    else:
+        norm_x = NORM_X_MIN + rel_x * NORM_SCALE_X
+        norm_y = NORM_Y_MIN + rel_y * NORM_SCALE_Y
+
+    corners = np.clip(np.column_stack((norm_x, norm_y)), 0, 65535).astype(np.uint16)
+
+    payload = struct.pack("<BHHHHHHHH",
+                          PACKET_ID_ROT_RECT,
+                          int(corners[0, 0]), int(corners[0, 1]),
+                          int(corners[1, 0]), int(corners[1, 1]),
+                          int(corners[2, 0]), int(corners[2, 1]),
+                          int(corners[3, 0]), int(corners[3, 1]))
+    checksum = sum(payload) & 0xFF
+    packet = bytes([START_BYTE]) + payload + bytes([checksum, END_BYTE])
+    return packet
+
+def open_serial_port(port=SERIAL_PORT, baudrate=BAUDRATE, timeout=SERIAL_TIMEOUT):
+    if serial is None:
+        print("Warning: pyserial 未安装，串口功能禁用")
+        return None
+    try:
+        ser = serial.Serial(port, baudrate=baudrate, timeout=timeout)
+        print(f"串口已打开：{port} @{baudrate}")
+        return ser
+    except serial.SerialException as exc:
+        print(f"无法打开串口 {port}: {exc}")
+        return None
+
+def send_rotated_rect_coordinates(ser, corners):
+    if ser is None:
+        return
+    packet = build_rot_rect_packet(corners)
+    try:
+        ser.write(packet)
+        ser.flush()
+        pts = [tuple(int(v) for v in pt) for pt in np.asarray(corners, dtype=np.int32)]
+        rel_x = (np.array(pts)[:,0] - RECOGNITION_LEFT) / RECOGNITION_WIDTH_ACTUAL
+        rel_y = (np.array(pts)[:,1] - RECOGNITION_TOP) / RECOGNITION_HEIGHT_ACTUAL
+        norm_pts = np.column_stack((NORM_X_MIN + rel_x*NORM_SCALE_X, NORM_Y_MIN + rel_y*NORM_SCALE_Y))
+        norm_pts = np.clip(norm_pts, 0, 65535).astype(np.int32)
+        print(f"已发送矩形坐标 -> STM32: {norm_pts.tolist()}")
+    except serial.SerialException as exc:
+        print(f"发送矩形坐标失败: {exc}")
+
+def serial_listener(ser):
+    global need_refresh_rect
+    while True:
+        if ser is None:
+            break
+        try:
+            data = ser.read(3)
+            if len(data) == 3 and data[0] == START_BYTE:
+                if data[1] == PACKET_ID_REFRESH and data[2] == END_BYTE:
+                    need_refresh_rect = True
+                    print("收到STM32指令：重新识别矩形")
+        except Exception as e:
+            print(f"串口监听异常: {e}")
+            break
+
+def sort_corners_clockwise(corners):
+    corners = sorted(corners, key=lambda p: p[1])
+    top = sorted(corners[:2], key=lambda p: p[0])
+    bottom = sorted(corners[2:], key=lambda p: p[0], reverse=True)
+    return np.array(top + bottom, dtype=np.int32)
+
+def limit_to_square_area(frame):
+    mask = np.zeros_like(frame[:, :, 0])
+    mask[RECOGNITION_TOP:RECOGNITION_BOTTOM, RECOGNITION_LEFT:RECOGNITION_RIGHT] = 255
+    frame_limited = cv2.bitwise_and(frame, frame, mask=mask)
+    return frame_limited, mask
+
+def detect_black_rectangle_frame(frame):
+    global current_mode
+    square_mask = None
+    if current_mode == 0:
+        frame, square_mask = limit_to_square_area(frame)
+
+    gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+    blur = cv2.GaussianBlur(gray, (5, 5), 0)
+    _, mask = cv2.threshold(blur, 80, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
+    kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (5, 5))
+    mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel, iterations=2)
+    mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel, iterations=1)
+
+    if current_mode == 0 and square_mask is not None:
+        mask = cv2.bitwise_and(mask, square_mask)
+
+    h_img, w_img = gray.shape
+    min_area = w_img * h_img * 0.09
+    min_side = min(w_img, h_img) * 0.02
+    contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    best_corners = None
+    best_area = 0
+    for cnt in contours:
+        area = cv2.contourArea(cnt)
+        if area < min_area:
+            continue
+        x, y, w, h = cv2.boundingRect(cnt)
+        if w < min_side or h < min_side:
+            continue
+        peri = cv2.arcLength(cnt, True)
+        approx = cv2.approxPolyDP(cnt, 0.02 * peri, True)
+        if len(approx) == 4 and cv2.isContourConvex(approx):
+            box = cv2.minAreaRect(cnt)
+            corners = cv2.boxPoints(box)
+            if area > best_area:
+                best_area = area
+                best_corners = corners
+
+    if best_corners is None and contours:
+        cnt = max(contours, key=cv2.contourArea)
+        if cv2.contourArea(cnt) >= min_area:
+            box = cv2.minAreaRect(cnt)
+            best_corners = cv2.boxPoints(box)
+
+    if best_corners is not None:
+        best_corners = sort_corners_clockwise(best_corners)
+    return best_corners, mask
+
+def main():
+    global need_refresh_rect, current_mode
+    picam2 = Picamera2()
+    config = picam2.create_preview_configuration(main={"size": (CAM_WIDTH, CAM_HEIGHT), "format": "BGR888"})
+    picam2.set_controls({"AeEnable": False, "AwbEnable": False, "ExposureTime": 10000, "AnalogueGain": 1.0})
+    picam2.configure(config)
+    picam2.start()
+
+    serial_port = None
+    if ENABLE_SERIAL:
+        serial_port = open_serial_port()
+        threading.Thread(target=serial_listener, args=(serial_port,), daemon=True).start()
+
+    print("="*70)
+    print(f"已启动：无紫色激光、无校准、纯开环控制")
+    print(f"识别区域：{RECOGNITION_WIDTH_ACTUAL}x{RECOGNITION_HEIGHT_ACTUAL}")
+    print("按键：q退出 | 1模式1 | 2模式2")
+    print("="*70)
+
+    last_corners = None
+    while True:
+        frame = picam2.capture_array()
+        display_frame = frame.copy()
+
+        # 绘制识别框
+        cv2.rectangle(display_frame,
+                      (RECOGNITION_LEFT, RECOGNITION_TOP),
+                      (RECOGNITION_RIGHT, RECOGNITION_BOTTOM),
+                      (255, 255, 0), 2, cv2.LINE_AA)
+
+        # 绘制四个顶点坐标
+        corners_box = [
+            (RECOGNITION_LEFT, RECOGNITION_TOP),
+            (RECOGNITION_RIGHT, RECOGNITION_TOP),
+            (RECOGNITION_RIGHT, RECOGNITION_BOTTOM),
+            (RECOGNITION_LEFT, RECOGNITION_BOTTOM)
+        ]
+        for x, y in corners_box:
+            cv2.circle(display_frame, (x, y), 6, (0, 255, 255), -1)
+            cv2.putText(display_frame, f"({x},{y})", (x+10, y-10),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 255), 1)
+
+        # 显示模式
+        cv2.putText(display_frame, f"Mode {current_mode+1}", (10, 30),
+                    cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 0), 2)
+
+        # 识别矩形
+        corners, mask = detect_black_rectangle_frame(frame)
+
+        # 模式2发送坐标
+        if current_mode == 1 and corners is not None:
+            send_flag = False
+            if last_corners is None or need_refresh_rect:
+                send_flag = True
+            else:
+                for i in range(4):
+                    if abs(corners[i][0] - last_corners[i][0]) > 50 or abs(corners[i][1] - last_corners[i][1]) > 50:
+                        send_flag = True
+                        break
+            if send_flag:
+                send_rotated_rect_coordinates(serial_port, corners)
+                last_corners = corners.copy()
+                need_refresh_rect = False
+
+        # 绘制识别的矩形
+        if last_corners is not None and current_mode == 1:
+            poly = np.array(last_corners, dtype=np.int32)
+            cv2.polylines(display_frame, [poly], True, (0, 0, 255), 2)
+
+        # 显示
+        cv2.imshow("Rect Tracking", display_frame)
+        cv2.imshow("Mask", mask)
+
+        key = cv2.waitKey(1) & 0xFF
+        if key == ord('q'):
+            break
+        elif key == ord('1'):
+            current_mode = 0
+            last_corners = None
+            print("切换到模式1")
+        elif key == ord('2'):
+            current_mode = 1
+            last_corners = None
+            need_refresh_rect = True
+            print("切换到模式2")
+
+    picam2.stop()
+    if serial_port is not None:
+        serial_port.close()
+    cv2.destroyAllWindows()
+
+if __name__ == "__main__":
+    main()
