@@ -1,0 +1,703 @@
+import cv2
+from picamera2 import Picamera2
+import numpy as np
+import struct
+import threading
+import sys
+import os
+import time
+try:
+    import serial
+except ImportError:
+    serial = None
+
+SERIAL_PORT = os.getenv("SERIAL_PORT", "/dev/serial0")
+BAUDRATE = 115200
+SERIAL_TIMEOUT = 1
+ENABLE_SERIAL = os.getenv("ENABLE_SERIAL", "1") != "0"
+START_BYTE = 0xAA
+END_BYTE = 0x55
+PACKET_ID = 0x01
+PACKET_ID_RECT = 0x02
+PACKET_ID_ROT_RECT = 0x03
+PACKET_ID_ALIGN = 0x06
+PACKET_ID_MODE_CTRL = 0x07
+PACKET_ID_ANGLE_CMD = 0x08
+SEND_MIN_INTERVAL = 0.04
+_last_send_time = 0.0
+
+
+def build_laser_packet(x, y):
+    x = int(max(0, min(65535, round(x))))
+    y = int(max(0, min(65535, round(y))))
+    payload = struct.pack("<BHH", PACKET_ID, x, y)
+    checksum = sum(payload) & 0xFF
+    packet = bytes([START_BYTE]) + payload + bytes([checksum, END_BYTE])
+    return packet
+
+
+def build_rect_packet(x1, y1, x2, y2):
+    x1 = int(max(0, min(65535, round(x1))))
+    y1 = int(max(0, min(65535, round(y1))))
+    x2 = int(max(0, min(65535, round(x2))))
+    y2 = int(max(0, min(65535, round(y2))))
+    payload = struct.pack("<BHHHH", PACKET_ID_RECT, x1, y1, x2, y2)
+    checksum = sum(payload) & 0xFF
+    packet = bytes([START_BYTE]) + payload + bytes([checksum, END_BYTE])
+    return packet
+
+
+def build_rot_rect_packet(corners):
+    corners = np.asarray(corners, dtype=np.int64).reshape(4, 2)
+    corners = np.clip(np.round(corners), 0, 65535).astype(np.uint16)
+    payload = struct.pack("<BHHHHHHHH",
+                          PACKET_ID_ROT_RECT,
+                          int(corners[0, 0]), int(corners[0, 1]),
+                          int(corners[1, 0]), int(corners[1, 1]),
+                          int(corners[2, 0]), int(corners[2, 1]),
+                          int(corners[3, 0]), int(corners[3, 1]))
+    checksum = sum(payload) & 0xFF
+    packet = bytes([START_BYTE]) + payload + bytes([checksum, END_BYTE])
+    return packet
+
+
+def build_alignment_packet(purple_x, purple_y, target_x, target_y):
+    purple_x = int(max(0, min(65535, round(purple_x))))
+    purple_y = int(max(0, min(65535, round(purple_y))))
+    target_x = int(max(0, min(65535, round(target_x))))
+    target_y = int(max(0, min(65535, round(target_y))))
+    payload = struct.pack("<BHHHH", PACKET_ID_ALIGN,
+                          purple_x, purple_y, target_x, target_y)
+    checksum = sum(payload) & 0xFF
+    packet = bytes([START_BYTE]) + payload + bytes([checksum, END_BYTE])
+    return packet
+
+
+def open_serial_port(port=SERIAL_PORT, baudrate=BAUDRATE, timeout=SERIAL_TIMEOUT):
+    if serial is None:
+        print("Warning: pyserial not installed")
+        return None
+    try:
+        ser = serial.Serial(port, baudrate=baudrate, timeout=timeout)
+        print("Serial opened: %s @ %d" % (port, baudrate))
+        return ser
+    except serial.SerialException as exc:
+        print("Cannot open serial %s: %s" % (port, exc))
+        return None
+def ensure_send_interval():
+    global _last_send_time
+    now = time.monotonic()
+    elapsed = now - _last_send_time
+    if elapsed < SEND_MIN_INTERVAL:
+        time.sleep(SEND_MIN_INTERVAL - elapsed)
+    _last_send_time = time.monotonic()
+
+
+def send_spot_coordinates(ser, x, y):
+    if ser is None:
+        return
+    ensure_send_interval()
+    packet = build_laser_packet(x, y)
+    try:
+        ser.write(packet)
+        ser.flush()
+        print("Send spot: x=%d, y=%d, packet=%s" % (int(x), int(y), packet.hex()))
+    except serial.SerialException as exc:
+        print("Serial send failed: %s" % exc)
+
+
+def send_rect_coordinates(ser, x1, y1, x2, y2):
+    if ser is None:
+        return
+    ensure_send_interval()
+    packet = build_rect_packet(x1, y1, x2, y2)
+    try:
+        ser.write(packet)
+        ser.flush()
+        print("Send rect: x1=%d, y1=%d, x2=%d, y2=%d, packet=%s" %
+              (int(x1), int(y1), int(x2), int(y2), packet.hex()))
+    except serial.SerialException as exc:
+        print("Serial send failed: %s" % exc)
+
+
+def send_rotated_rect_coordinates(ser, corners):
+    if ser is None:
+        return
+    ensure_send_interval()
+    packet = build_rot_rect_packet(corners)
+    try:
+        ser.write(packet)
+        ser.flush()
+        pts = [tuple(int(v) for v in pt) for pt in np.asarray(corners, dtype=np.int32)]
+        print("Send rotated rect: %s, packet=%s" % (pts, packet.hex()))
+    except serial.SerialException as exc:
+        print("Serial send failed: %s" % exc)
+
+
+def send_alignment_packet(ser, purple_x, purple_y, target_x, target_y):
+    if ser is None:
+        return
+    ensure_send_interval()
+    packet = build_alignment_packet(purple_x, purple_y, target_x, target_y)
+    try:
+        ser.write(packet)
+        ser.flush()
+        print("Send align: purple=(%d,%d), target=(%d,%d), packet=%s" %
+              (int(purple_x), int(purple_y), int(target_x), int(target_y), packet.hex()))
+    except serial.SerialException as exc:
+        print("Serial send failed: %s" % exc)
+
+
+def build_mode_ctrl_packet(mode):
+    payload = struct.pack("<BB", PACKET_ID_MODE_CTRL, mode)
+    checksum = sum(payload) & 0xFF
+    packet = bytes([START_BYTE]) + payload + bytes([checksum, END_BYTE])
+    return packet
+def send_mode_ctrl(ser, mode):
+    if ser is None:
+        return
+    ensure_send_interval()
+    packet = build_mode_ctrl_packet(mode)
+    try:
+        ser.write(packet)
+        ser.flush()
+        print(">>> Send mode ctrl: mode=%d (%s), packet=%s" %
+              (mode, "align" if mode == 0 else "tracking", packet.hex()))
+    except serial.SerialException as exc:
+        print("Serial send failed: %s" % exc)
+
+
+YAW_CENTER = 42.0
+PITCH_CENTER = -11.0
+YAW_SCALE = 0.3
+PITCH_SCALE = 0.45
+
+def build_angle_cmd_packet(yaw_angle, pitch_angle):
+    yaw_int = int(max(-32768, min(32767, round(yaw_angle * 100))))
+    pitch_int = int(max(-32768, min(32767, round(pitch_angle * 100))))
+    payload = struct.pack("<Bhh", PACKET_ID_ANGLE_CMD, yaw_int, pitch_int)
+    checksum = sum(payload) & 0xFF
+    packet = bytes([START_BYTE]) + payload + bytes([checksum, END_BYTE])
+    return packet
+
+
+def send_angle_cmd(ser, yaw, pitch):
+    if ser is None:
+        return
+    ensure_send_interval()
+    packet = build_angle_cmd_packet(yaw, pitch)
+    try:
+        ser.write(packet)
+        ser.flush()
+        print(">>> Angle cmd: yaw=%.1f, pitch=%.1f" % (yaw, pitch))
+    except serial.SerialException as exc:
+        print("Serial send failed: %s" % exc)
+
+
+def detect_purple_spot(frame, region=None):
+    hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
+    lower_purple = np.array([85, 60, 20])    
+    upper_purple = np.array([150, 255, 255])  
+    mask = cv2.inRange(hsv, lower_purple, upper_purple)
+    kernel = np.ones((5, 5), np.uint8)
+    mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel)
+    mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel)
+    if region is not None:
+        try:
+            h_img, w_img = mask.shape
+            rx1, ry1, rx2, ry2 = map(int, region)
+            rx1 = max(0, min(w_img, rx1))
+            rx2 = max(0, min(w_img, rx2))
+            ry1 = max(0, min(h_img, ry1))
+            ry2 = max(0, min(h_img, ry2))
+            region_mask = np.zeros_like(mask)
+            if ry2 > ry1 and rx2 > rx1:
+                region_mask[ry1:ry2, rx1:rx2] = 255
+            mask = cv2.bitwise_and(mask, region_mask)
+        except Exception:
+            pass
+    contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    if contours:
+        largest = max(contours, key=cv2.contourArea)
+        area = cv2.contourArea(largest)
+        if area > 5:
+            (x, y), radius = cv2.minEnclosingCircle(largest)
+            return (int(x), int(y)), mask
+    return None, mask
+def rects_are_similar(prev_corners, curr_corners, max_center_shift=8, max_area_ratio=0.15):
+    if prev_corners is None or curr_corners is None:
+        return False
+    prev = np.asarray(prev_corners, dtype=np.float32).reshape(4, 2)
+    curr = np.asarray(curr_corners, dtype=np.float32).reshape(4, 2)
+    prev_center = np.mean(prev, axis=0)
+    curr_center = np.mean(curr, axis=0)
+    center_dist = np.linalg.norm(prev_center - curr_center)
+    if center_dist > max_center_shift:
+        return False
+    prev_area = abs(cv2.contourArea(prev.reshape(4, 1, 2)))
+    curr_area = abs(cv2.contourArea(curr.reshape(4, 1, 2)))
+    if prev_area <= 0 or curr_area <= 0:
+        return False
+    if abs(prev_area - curr_area) / max(prev_area, curr_area) > max_area_ratio:
+        return False
+    return True
+def sort_corners_clockwise(corners):
+    corners = sorted(corners, key=lambda p: p[1])
+    top = sorted(corners[:2], key=lambda p: p[0])
+    bottom = sorted(corners[2:], key=lambda p: p[0], reverse=True)
+    return np.array(top + bottom, dtype=np.int32)
+
+
+def detect_black_rectangle_frame(frame,
+                                 region=None,
+                                 threshold_value=80,
+                                 min_area_ratio=0.01,
+                                 min_side_ratio=0.09,
+                                 max_aspect_ratio=2.0,
+                                 max_angle_error=25.0):
+    def is_rectangle(corners):
+        corners = corners.reshape(4, 2).astype(np.float32)
+        corners = sort_corners_clockwise(corners)
+        for i in range(4):
+            p0 = corners[i]
+            p1 = corners[(i + 1) % 4]
+            p2 = corners[(i + 2) % 4]
+            v1 = p0 - p1
+            v2 = p2 - p1
+            norm1 = np.linalg.norm(v1)
+            norm2 = np.linalg.norm(v2)
+            if norm1 < 1e-6 or norm2 < 1e-6:
+                return False
+            cos_angle = abs(np.dot(v1, v2) / (norm1 * norm2))
+            if cos_angle > np.cos(np.deg2rad(max_angle_error)):
+                return False
+        return True
+
+    h_img, w_img = frame.shape[:2]
+    rx1 = ry1 = rx2 = ry2 = None
+    roi = frame
+
+    if region is not None:
+        try:
+            rx1, ry1, rx2, ry2 = map(int, region)
+            rx1 = max(0, min(w_img, rx1))
+            rx2 = max(0, min(w_img, rx2))
+            ry1 = max(0, min(h_img, ry1))
+            ry2 = max(0, min(h_img, ry2))
+            if ry2 > ry1 and rx2 > rx1:
+                roi = frame[ry1:ry2, rx1:rx2]
+        except Exception:
+            roi = frame
+
+    gray = cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY)
+    blur = cv2.GaussianBlur(gray, (7, 7), 0)
+    equalized = cv2.equalizeHist(blur)
+
+    _, thresh = cv2.threshold(equalized, threshold_value, 255,
+                              cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
+    adapt = cv2.adaptiveThreshold(equalized, 255,
+                                  cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
+                                  cv2.THRESH_BINARY_INV, 11, 4)
+    mask = cv2.bitwise_or(thresh, adapt)
+    kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (3, 3))
+    mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel, iterations=1)
+    mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel, iterations=1)
+    edges = cv2.Canny(mask, 20, 100)
+    edges = cv2.dilate(edges, kernel, iterations=1)
+
+    h_roi, w_roi = gray.shape
+    min_area = max(1, w_roi * h_roi * min_area_ratio)
+    min_side = max(1, min(w_roi, h_roi) * min_side_ratio)
+
+    contours, _ = cv2.findContours(edges, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    best_corners = None
+    best_score = 0
+    full_mask = np.zeros((h_img, w_img), dtype=np.uint8)
+    if region is not None and rx1 is not None:
+        full_mask[ry1:ry2, rx1:rx2] = mask
+    else:
+        full_mask = mask
+
+    for cnt in contours:
+        area = cv2.contourArea(cnt)
+        if area < min_area:
+            continue
+
+        peri = cv2.arcLength(cnt, True)
+        approx = cv2.approxPolyDP(cnt, 0.02 * peri, True)
+        if len(approx) != 4 or not cv2.isContourConvex(approx):
+            continue
+
+        corners = approx.reshape(4, 2).astype(np.int32)
+        x, y, w, h = cv2.boundingRect(corners)
+        if w < min_side or h < min_side:
+            continue
+
+        aspect_ratio = max(w, h) / min(w, h)
+        if aspect_ratio > max_aspect_ratio:
+            continue
+
+        if not is_rectangle(corners):
+            rect = cv2.minAreaRect(cnt)
+            corners = np.int32(cv2.boxPoints(rect))
+            if not is_rectangle(corners):
+                continue
+            x, y, w, h = cv2.boundingRect(corners)
+            if w < min_side or h < min_side:
+                continue
+
+        rect_area = float(w * h)
+        fill_ratio = area / rect_area if rect_area > 0 else 0
+        if fill_ratio < 0.35:
+            continue
+
+        if region is not None and rx1 is not None:
+            if np.any(corners[:, 0] < 0) or np.any(corners[:, 0] >= w_roi) or np.any(corners[:, 1] < 0) or np.any(corners[:, 1] >= h_roi):
+                continue
+
+        score = fill_ratio * area
+        if score > best_score:
+            best_score = score
+            best_corners = corners
+
+    if best_corners is None and contours:
+        for cnt in sorted(contours, key=cv2.contourArea, reverse=True)[:3]:
+            area = cv2.contourArea(cnt)
+            if area < min_area:
+                continue
+            rect = cv2.minAreaRect(cnt)
+            box = np.int32(cv2.boxPoints(rect))
+            x, y, w, h = cv2.boundingRect(box)
+            if w < min_side or h < min_side:
+                continue
+            aspect_ratio = max(w, h) / min(w, h)
+            if aspect_ratio > max_aspect_ratio:
+                continue
+            if not is_rectangle(box):
+                continue
+            rect_area = float(w * h)
+            fill_ratio = area / rect_area if rect_area > 0 else 0
+            if fill_ratio < 0.35:
+                continue
+            best_corners = box
+            break
+    if best_corners is not None:
+        if region is not None and rx1 is not None:
+            best_corners = best_corners + np.array([rx1, ry1])
+        best_corners = sort_corners_clockwise(best_corners)
+        EXPAND_PX = 6
+        center = np.mean(best_corners, axis=0)
+        for i in range(4):
+                  vec = best_corners[i] - center
+                  norm = np.linalg.norm(vec)
+                  if norm > 1e-6:
+                      best_corners[i] = best_corners[i] + vec / norm * EXPAND_PX
+
+    lines = []
+    if best_corners is not None:
+        for i in range(4):
+            x1, y1 = int(best_corners[i, 0]), int(best_corners[i, 1])
+            x2, y2 = int(best_corners[(i + 1) % 4, 0]), int(best_corners[(i + 1) % 4, 1])
+            lines.append((x1, y1, x2, y2))
+
+    return best_corners, lines, full_mask
+
+
+# 新增函数：在两个顶点之间生成等距中间点
+def generate_path_points(corners, points_per_edge=4):
+    """
+    在矩形的每两个相邻顶点之间生成等距的中间点
+    :param corners: 4个顶点的坐标数组，形状为(4, 2)
+    :param points_per_edge: 每条边的总点数（包括两个顶点）
+    :return: 完整的路径点数组，形状为(4*(points_per_edge-1), 2)
+    """
+    path_points = []
+    num_vertices = len(corners)
+    
+    for i in range(num_vertices):
+        start_point = corners[i]
+        end_point = corners[(i + 1) % num_vertices]
+        
+        # 生成从start_point到end_point的等距点（不包括end_point，避免重复）
+        for j in range(points_per_edge - 1):
+            t = j / (points_per_edge - 1)
+            x = int(start_point[0] + t * (end_point[0] - start_point[0]))
+            y = int(start_point[1] + t * (end_point[1] - start_point[1]))
+            path_points.append([x, y])
+    
+    return np.array(path_points, dtype=np.int32)
+
+
+def stdin_listener(mode_holder, serial_port=None):
+    print("=" * 50)
+    print("  Terminal control:")
+    print("    0 -> align mode: detect rect + purple, send angle cmd")
+    print("    1 -> tracking mode: follow vertices clockwise")
+    print("=" * 50)
+    while True:
+        try:
+            s = sys.stdin.readline()
+            if not s:
+                break
+            s = s.strip()
+            if s == '0':
+                mode_holder['mode'] = 'align'
+                send_mode_ctrl(serial_port, 0)
+                print(">>> Mode: align (calibration)")
+            elif s == '1':
+                mode_holder['mode'] = 'tracking'
+                send_mode_ctrl(serial_port, 1)
+                print(">>> Mode: tracking (vertex follow)")
+        except Exception:
+            break
+
+
+def main():
+    picam2 = Picamera2()
+    config = picam2.create_preview_configuration(main={"size": (960, 960), "format": "BGR888"})
+    picam2.set_controls({"AeEnable": False, "AwbEnable": False, "ExposureTime": 10000, "AnalogueGain": 1.0})
+    picam2.configure(config)
+    picam2.start()
+
+    serial_port = None
+    if ENABLE_SERIAL:
+        serial_port = open_serial_port()
+
+    print("Press 'q' to quit")
+
+    cv2.namedWindow("Purple Laser Tracking", cv2.WINDOW_NORMAL)
+    def _nothing(x):
+        pass
+    cv2.createTrackbar("Region Width %", "Purple Laser Tracking", 62, 100, _nothing)
+    cv2.createTrackbar("Region Height %", "Purple Laser Tracking", 65, 100, _nothing)
+    mode_holder = {'mode': 'align'}
+    last_sent_rect = None
+    last_angle_yaw = YAW_CENTER
+    last_angle_pitch = PITCH_CENTER
+    last_corners = None
+    last_path_points = None  # 新增：保存完整的路径点列表
+    PIXEL_GAIN = 0.002
+    TRACKING_THRESHOLD = 6
+    spot_lost_count = 0
+    SPOT_LOST_RESET = 90
+    tracking_target_idx = None     # 当前追踪的目标点索引
+    TRACKING_CONVERGE_PX = 8      # 到达目标点的阈值
+    POINTS_PER_EDGE = 4  # 每条边的点数（2个顶点+2个中间点=4个点，每两个顶点之间有3个间隔）
+    t = threading.Thread(target=stdin_listener, args=(mode_holder, serial_port), daemon=True)
+    t.start()
+
+    while True:
+        frame = picam2.capture_array()
+        mode = mode_holder.get('mode', 'align')
+
+        raw_display = cv2.normalize(frame, None, 0, 255, cv2.NORM_MINMAX)
+        if mode in ('align', 'black_frame'):
+            display_frame = cv2.convertScaleAbs(raw_display, alpha=0.5, beta=-20)
+        else:
+            display_frame = cv2.convertScaleAbs(raw_display, alpha=1.0, beta=50)
+
+        # ===== Common region calculation (same for tracking and align) =====
+        h_img, w_img = frame.shape[:2]
+        w_pct = cv2.getTrackbarPos("Region Width %", "Purple Laser Tracking")
+        h_pct = cv2.getTrackbarPos("Region Height %", "Purple Laser Tracking")
+        w_pct = max(1, w_pct)
+        h_pct = max(1, h_pct)
+        cx, cy = w_img // 2, h_img // 2
+        half_w = int(w_img * w_pct / 200.0)
+        half_h = int(h_img * h_pct / 200.0)
+        rx1 = max(0, cx - half_w)
+        ry1 = max(0, cy - half_h)
+        rx2 = min(w_img, cx + half_w)
+        ry2 = min(h_img, cy + half_h)
+
+        # Draw region box
+        cv2.rectangle(display_frame, (rx1, ry1), (rx2, ry2), (255, 255, 0), 2)
+
+        if mode in ('tracking', 'purple'):
+            # ===== TRACKING MODE: detect rect + purple, follow path points =====
+            corners, lines, _ = detect_black_rectangle_frame(frame, region=(rx1, ry1, rx2, ry2))
+            if corners is not None:
+                last_corners = corners
+                # 当检测到新的矩形时，重新生成完整的路径点
+                last_path_points = generate_path_points(corners, POINTS_PER_EDGE)
+                print(f">>> Generated path with {len(last_path_points)} points")
+
+            center, mask = detect_purple_spot(frame, region=(rx1, ry1, rx2, ry2))
+
+            if center is not None:
+                if spot_lost_count > SPOT_LOST_RESET:
+                          last_angle_yaw = YAW_CENTER
+                          last_angle_pitch = PITCH_CENTER
+                          print(">>> Spot reappeared after loss, reset last_angle to center")
+                          if last_path_points is not None and len(last_path_points) > 0:
+                              send_alignment_packet(serial_port, center[0], center[1],
+                                                    int(last_path_points[0, 0]), int(last_path_points[0, 1]))
+                              print(">>> Sent wake-up alignment packet")
+                cv2.circle(display_frame, center, 5, (0, 0, 255), -1)
+                cv2.putText(display_frame, "Spot: %s" % (str(center),), (center[0] + 10, center[1] - 10),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 2)
+
+                if mode == 'tracking' and last_path_points is not None and len(last_path_points) > 0:
+                    poly = np.array(last_corners, dtype=np.int32)
+                    
+                    # 绘制所有路径点
+                    for i, point in enumerate(last_path_points):
+                        cv2.circle(display_frame, tuple(point), 3, (255, 0, 0), -1)
+                    
+                    # 初始化或重新计算追踪目标
+                    if tracking_target_idx is None:
+                        dists = np.linalg.norm(last_path_points - np.array(center), axis=1)
+                        tracking_target_idx = (int(np.argmin(dists)) + 1) % len(last_path_points)
+                        print(">>> Tracking start: target point %d" % tracking_target_idx)
+                    else:
+                        # 检查是否到达当前目标点
+                        cur_target = last_path_points[tracking_target_idx]
+                        dist_to_target = np.linalg.norm(np.array(center) - cur_target)
+
+                        # 如果离当前目标太远，重新寻找最近的点
+                        if dist_to_target > 300:
+                            dists = np.linalg.norm(last_path_points - np.array(center), axis=1)
+                            nearest_idx = int(np.argmin(dists))
+                            new_target = (nearest_idx + 1) % len(last_path_points)
+                            if new_target != tracking_target_idx:
+                                print(">>> Tracking lost, recalc target: point %d -> point %d" %
+                                      (tracking_target_idx, new_target))
+                                tracking_target_idx = new_target
+                        elif dist_to_target < TRACKING_CONVERGE_PX:
+                            old_idx = tracking_target_idx
+                            tracking_target_idx = (tracking_target_idx + 1) % len(last_path_points)
+                            print(">>> Reached point %d, advance to point %d" % (old_idx, tracking_target_idx))
+
+                    target_idx = tracking_target_idx
+                    target_point = last_path_points[target_idx]
+                    cv2.line(display_frame, center, tuple(target_point), (0, 255, 255), 2)
+                    cv2.circle(display_frame, tuple(target_point), 7, (0, 255, 255), -1)
+                    cv2.putText(display_frame, "P%d" % target_idx,
+                                (int(target_point[0]) + 8, int(target_point[1]) - 8),
+                                cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 255), 2)
+
+                    dx = target_point[0] - center[0]
+                    dy = target_point[1] - center[1]
+                    target_yaw   = last_angle_yaw   - dx * PIXEL_GAIN
+                    target_pitch = last_angle_pitch - dy * PIXEL_GAIN
+
+                    MAX_STEP = 0.05
+                    dyaw = target_yaw - last_angle_yaw
+                    if dyaw > MAX_STEP:
+                        target_yaw = last_angle_yaw + MAX_STEP
+                    elif dyaw < -MAX_STEP:
+                        target_yaw = last_angle_yaw - MAX_STEP
+                    dpitch = target_pitch - last_angle_pitch
+                    if dpitch > MAX_STEP:
+                        target_pitch = last_angle_pitch + MAX_STEP
+                    elif dpitch < -MAX_STEP:
+                        target_pitch = last_angle_pitch - MAX_STEP
+                    last_angle_yaw = target_yaw
+                    last_angle_pitch = target_pitch
+                    send_angle_cmd(serial_port, target_yaw, target_pitch)
+
+                    err_px = np.sqrt(dx**2 + dy**2)
+                    cv2.putText(display_frame, "Track err: %.1fpx" % err_px,
+                                (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 255), 2)
+                    cv2.putText(display_frame, "Target:P%d Yaw:%.1f Pitch:%.1f" %
+                                (target_idx, target_yaw, target_pitch),
+                                (10, 55), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 255), 1)
+                else:
+                    send_spot_coordinates(serial_port, center[0], center[1])
+                spot_lost_count = 0
+            else:
+                    spot_lost_count += 1
+            if last_corners is not None and mode == 'tracking':
+                poly_draw = np.array(last_corners, dtype=np.int32)
+                cv2.polylines(display_frame, [poly_draw], True, (0, 0, 255), 2)
+
+        else:
+            # ===== ALIGN MODE: detect rect + purple, align to nearest vertex =====
+            corners, lines, mask = detect_black_rectangle_frame(frame, region=(rx1, ry1, rx2, ry2))
+            purple_center, purple_mask = detect_purple_spot(frame, region=(rx1, ry1, rx2, ry2))
+
+            if purple_center is not None:
+                if spot_lost_count > SPOT_LOST_RESET:
+                    last_angle_yaw = YAW_CENTER
+                    last_angle_pitch = PITCH_CENTER
+                    print(">>> Spot reappeared after loss, reset last_angle to center")
+                    if corners is not None:
+                        send_alignment_packet(serial_port, purple_center[0], purple_center[1],
+                                              corners[0][0], corners[0][1])
+                        print(">>> Sent wake-up alignment packet")
+                spot_lost_count = 0
+                cv2.circle(display_frame, purple_center, 5, (255, 0, 255), -1)
+                cv2.putText(display_frame, "Purple: %s" % (str(purple_center),),
+                            (purple_center[0] + 10, purple_center[1] - 10),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 2)
+
+                if corners is not None:
+                    pts = np.array(corners, dtype=np.int32)
+                    dists = np.linalg.norm(pts - np.array(purple_center), axis=1)
+                    nearest_idx = int(np.argmin(dists))
+                    nearest_vertex = pts[nearest_idx]
+
+                    cv2.line(display_frame, purple_center, tuple(nearest_vertex), (0, 255, 255), 1)
+
+                    dx = nearest_vertex[0] - purple_center[0]
+                    dy = nearest_vertex[1] - purple_center[1]
+
+                    target_yaw   = last_angle_yaw   - dx * PIXEL_GAIN
+                    target_pitch = last_angle_pitch - dy * PIXEL_GAIN
+
+                    MAX_STEP = 0.2
+                    dyaw = target_yaw - last_angle_yaw
+                    if dyaw > MAX_STEP:
+                        target_yaw = last_angle_yaw + MAX_STEP
+                    elif dyaw < -MAX_STEP:
+                        target_yaw = last_angle_yaw - MAX_STEP
+                    dpitch = target_pitch - last_angle_pitch
+                    if dpitch > MAX_STEP:
+                        target_pitch = last_angle_pitch + MAX_STEP
+                    elif dpitch < -MAX_STEP:
+                        target_pitch = last_angle_pitch - MAX_STEP
+
+                    last_angle_yaw = target_yaw
+                    last_angle_pitch = target_pitch
+
+                    send_angle_cmd(serial_port, target_yaw, target_pitch)
+                    err_px = np.sqrt(dx**2 + dy**2)
+                    cv2.putText(display_frame, "Align err: %.1fpx" % err_px,
+                                (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 255), 2)
+                    cv2.putText(display_frame, "Yaw:%.1f Pitch:%.1f" % (target_yaw, target_pitch),
+                                (10, 55), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 255), 1)
+            else:
+                spot_lost_count += 1
+            if corners is not None:
+                last_corners = corners
+                poly = np.array(corners, dtype=np.int32)
+                cv2.polylines(display_frame, [poly], True, (0, 0, 255), 2)
+                for (x, y) in poly:
+                    cv2.circle(display_frame, (int(x), int(y)), 4, (0, 255, 0), -1)
+                cv2.putText(display_frame, "RotRect",
+                            (int(poly[0, 0]), max(int(poly[0, 1]) - 10, 0)),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 2)
+                if last_sent_rect is None or not rects_are_similar(last_sent_rect, poly):
+                    send_rotated_rect_coordinates(serial_port, poly)
+                    last_sent_rect = poly.copy()
+                else:
+                    print("Rect stable, suppress repeat send")
+            elif lines:
+                for (x1, y1, x2, y2) in lines:
+                    cv2.line(display_frame, (x1, y1), (x2, y2), (0, 0, 255), 2)
+            mask = mask if mask is not None else purple_mask
+
+        cv2.imshow("Purple Laser Tracking", display_frame)
+        cv2.imshow("Purple Mask", mask)
+
+        if cv2.waitKey(1) & 0xFF == ord('q'):
+            break
+
+    picam2.stop()
+    if serial_port is not None:
+        serial_port.close()
+    cv2.destroyAllWindows()
+
+
+if __name__ == "__main__":
+    main()
